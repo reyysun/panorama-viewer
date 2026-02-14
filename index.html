@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Загрузка кубической панорамы</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.css" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f172a;
+      --muted: #9ca3af;
+      --accent: #22d3ee;
+      --border: #334155;
+      --ok: #10b981;
+      --warn: #f59e0b;
+      --error: #ef4444;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top, #1e293b, var(--bg));
+      color: #f8fafc;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .topbar {
+      padding: 1rem;
+      background: rgba(15, 23, 42, 0.9);
+      backdrop-filter: blur(6px);
+      border-bottom: 1px solid var(--border);
+      display: grid;
+      gap: 0.75rem;
+    }
+
+    .title { margin: 0; font-size: 1.1rem; }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.4;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+    }
+
+    .dropzone {
+      border: 2px dashed var(--border);
+      border-radius: 10px;
+      padding: 0.85rem 1rem;
+      background: rgba(17, 24, 39, 0.7);
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .dropzone.dragover {
+      border-color: var(--accent);
+      background: rgba(34, 211, 238, 0.12);
+    }
+
+    button {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.5rem 0.8rem;
+      background: #1f2937;
+      color: #f8fafc;
+      cursor: pointer;
+    }
+
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #status { font-size: 0.9rem; color: var(--muted); margin: 0; }
+    #status.ok { color: var(--ok); }
+    #status.warn { color: var(--warn); }
+    #status.error { color: var(--error); }
+
+    #viewer {
+      width: 100%;
+      height: calc(100vh - 175px);
+      min-height: 420px;
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <h1 class="title">Просмотр кубической панорамы (Pannellum)</h1>
+    <p class="subtitle">
+      Перетащите ZIP-файл с 6 изображениями граней куба в формате <code>panorama_0 ... panorama_5</code>.
+      Порядок граней: <code>0:+X, 1:-X, 2:+Y, 3:-Y, 4:+Z, 5:-Z</code> (допустимы расширения jpg/png/webp).
+    </p>
+    <div class="controls">
+      <label id="dropzone" class="dropzone" for="zipInput">📦 Перетащите ZIP сюда или нажмите для выбора</label>
+      <input id="zipInput" type="file" accept=".zip,application/zip" hidden />
+      <button id="resetBtn" disabled>Сбросить панораму</button>
+    </div>
+    <p id="status">Ожидание ZIP-файла…</p>
+  </header>
+
+  <main id="viewer"></main>
+
+  <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pannellum@2.5.6/build/pannellum.js"></script>
+  <script>
+    const viewerContainer = document.getElementById('viewer');
+    const dropzone = document.getElementById('dropzone');
+    const zipInput = document.getElementById('zipInput');
+    const statusEl = document.getElementById('status');
+    const resetBtn = document.getElementById('resetBtn');
+
+    let viewer = null;
+    let activeObjectUrls = [];
+
+    function setStatus(text, level = '') {
+      statusEl.textContent = text;
+      statusEl.className = level;
+    }
+
+    function cleanupUrls() {
+      activeObjectUrls.forEach((u) => URL.revokeObjectURL(u));
+      activeObjectUrls = [];
+    }
+
+    function destroyViewer() {
+      if (viewer && typeof viewer.destroy === 'function') {
+        viewer.destroy();
+      }
+      viewer = null;
+      viewerContainer.innerHTML = '';
+    }
+
+    function resetPanorama() {
+      destroyViewer();
+      cleanupUrls();
+      resetBtn.disabled = true;
+      setStatus('Панорама сброшена. Загрузите новый ZIP.', 'warn');
+    }
+
+    function normalize(name) {
+      return name.toLowerCase().replace(/\\/g, '/');
+    }
+
+    function mapFaces(files) {
+      const keyed = new Array(6).fill(null);
+
+      files.forEach((entry) => {
+        const lower = normalize(entry.name);
+        const base = lower.split('/').pop() || '';
+        const bare = base.replace(/\.[a-z0-9]+$/, '');
+        const match = bare.match(/^panorama_(\d+)$/);
+        if (!match) return;
+
+        const index = Number(match[1]);
+        if (!Number.isInteger(index) || index < 0 || index > 5) return;
+        if (!keyed[index]) keyed[index] = entry;
+      });
+
+      const missingIndexes = keyed
+        .map((entry, index) => (entry ? null : index))
+        .filter((index) => index !== null);
+
+      return { ordered: keyed, missingIndexes, valid: missingIndexes.length === 0 };
+    }
+
+    function toPannellumCubeMap(indexedUrls) {
+      // Pannellum cubeMap order: [front, right, back, left, up, down]
+      // Source indexes: 0:+X, 1:-X, 2:+Y, 3:-Y, 4:+Z, 5:-Z
+      return [
+        indexedUrls[4], // front (+Z)
+        indexedUrls[0], // right (+X)
+        indexedUrls[5], // back (-Z)
+        indexedUrls[1], // left (-X)
+        indexedUrls[2], // up (+Y)
+        indexedUrls[3]  // down (-Y)
+      ];
+    }
+
+    async function loadZip(file) {
+      if (!file) return;
+      if (!window.fflate?.unzipSync) {
+        setStatus('fflate не загружен. Проверьте подключение CDN.', 'error');
+        return;
+      }
+      if (!window.pannellum?.viewer) {
+        setStatus('Pannellum не загружен. Проверьте подключение CDN.', 'error');
+        return;
+      }
+
+      setStatus('Чтение ZIP...', '');
+      try {
+        const zipData = new Uint8Array(await file.arrayBuffer());
+        const archive = window.fflate.unzipSync(zipData);
+
+        const imageEntries = Object.entries(archive)
+          .map(([name, data]) => ({ name, data }))
+          .filter((entry) => !entry.name.endsWith('/'))
+          .filter((entry) => /\.(jpe?g|png|webp)$/i.test(entry.name));
+
+        if (imageEntries.length !== 6) {
+          setStatus(`Ожидалось ровно 6 изображений, найдено: ${imageEntries.length}.`, 'error');
+          return;
+        }
+
+        const { ordered, missingIndexes, valid } = mapFaces(imageEntries);
+        if (!valid) {
+          setStatus(`Не найдены обязательные файлы panorama_{${missingIndexes.join(', ')}}. Проверьте имена.`, 'error');
+          return;
+        }
+
+        const indexedUrls = ordered.map((entry) => URL.createObjectURL(new Blob([entry.data])));
+        const cubeMapUrls = toPannellumCubeMap(indexedUrls);
+
+        destroyViewer();
+        cleanupUrls();
+
+        activeObjectUrls = indexedUrls;
+        viewer = window.pannellum.viewer('viewer', {
+          type: 'cubemap',
+          cubeMap: cubeMapUrls,
+          autoLoad: true,
+          showControls: true
+        });
+
+        resetBtn.disabled = false;
+        setStatus('Панорама успешно загружена в Pannellum.', 'ok');
+      } catch (error) {
+        console.error(error);
+        setStatus(`Ошибка обработки ZIP: ${error.message || error}`, 'error');
+      }
+    }
+
+    dropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropzone.classList.add('dragover');
+    });
+
+    dropzone.addEventListener('dragleave', () => {
+      dropzone.classList.remove('dragover');
+    });
+
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropzone.classList.remove('dragover');
+      loadZip(e.dataTransfer?.files?.[0]);
+    });
+
+    zipInput.addEventListener('change', () => {
+      loadZip(zipInput.files?.[0]);
+    });
+
+    resetBtn.addEventListener('click', resetPanorama);
+    window.addEventListener('beforeunload', () => {
+      destroyViewer();
+      cleanupUrls();
+    });
+  </script>
+</body>
+</html>
